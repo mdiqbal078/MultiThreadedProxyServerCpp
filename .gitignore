@@ -1,0 +1,10 @@
+# Compiled object files
+*.o
+*.obj
+
+# Executable
+proxy
+
+# OS specific files
+.DS_Store
+Thumbs.db
