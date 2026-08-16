@@ -1,14 +1,26 @@
 CXX = g++
-CXXFLAGS = -g -Wall -std=c++20 -pthread
+CXXFLAGS = -std=c++20 -Wall -Wextra -pthread -O3
 
-all: proxy
+# Files
+SRCS = proxy_server_with_cache.cpp proxy_parse.cpp
+OBJS = $(SRCS:.cpp=.o)
+HEADERS = buffer.hpp metrics.hpp acl.hpp rate_limiter.hpp lru_cache.hpp event_loop.hpp dns_resolver.hpp proxy_parse.hpp
 
-proxy: proxy_server_with_cache.cpp proxy_parse.cpp
-	$(CXX) $(CXXFLAGS) -o proxy_parse.o -c proxy_parse.cpp
-	$(CXX) $(CXXFLAGS) -o proxy.o -c proxy_server_with_cache.cpp
-	$(CXX) $(CXXFLAGS) -o proxy proxy_parse.o proxy.o
+TARGET = proxy
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJS)
+
+%.o: %.cpp $(HEADERS)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# AddressSanitizer build for memory safety verification
+asan: CXXFLAGS += -fsanitize=address -g -O1
+asan: clean $(TARGET)
 
 clean:
-	rm -f proxy *.o
+	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all clean
+.PHONY: all clean asan

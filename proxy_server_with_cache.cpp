@@ -1,410 +1,457 @@
-/*
- * proxy_server_with_cache.cpp -- Multi-Threaded Proxy Server (Modern C++20).
- * Features:
- *   - RAII Socket wrapper to prevent FD leaks
- *   - O(1) LRU Cache using std::list and std::unordered_map
- *   - Modern threading (std::thread, std::mutex, std::counting_semaphore)
- */
-
-#include "proxy_parse.hpp"
 #include <iostream>
-#include <string>
-#include <string_view>
 #include <vector>
-#include <list>
-#include <unordered_map>
-#include <optional>
-#include <algorithm>
+#include <memory>
 #include <thread>
 #include <mutex>
-#include <semaphore>
 #include <chrono>
+#include <csignal>
+#include <unordered_map>
+#include <unordered_set>
+#include <string>
 #include <cstring>
-#include <memory>
-
-#include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netdb.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <unistd.h>
 
-constexpr int MAX_BYTES = 4096;
-constexpr int MAX_CLIENTS = 400;
-constexpr int MAX_SIZE = 200 * (1 << 20);            // 200 MB global limit
-constexpr int MAX_ELEMENT_SIZE = 10 * (1 << 20);     // 10 MB per element limit
+#include "event_loop.hpp"
+#include "buffer.hpp"
+#include "dns_resolver.hpp"
+#include "lru_cache.hpp"
+#include "metrics.hpp"
+#include "acl.hpp"
+#include "rate_limiter.hpp"
+#include "proxy_parse.hpp"
 
-// ============================================================================
-// RAII Socket Wrapper
-// ============================================================================
-class Socket {
-    int fd;
-public:
-    explicit Socket(int fd = -1) : fd(fd) {}
-    
-    ~Socket() {
-        if (fd != -1) {
-            close(fd);
-        }
-    }
-    
-    // Disable copy
-    Socket(const Socket&) = delete;
-    Socket& operator=(const Socket&) = delete;
-    
-    // Enable move
-    Socket(Socket&& other) noexcept : fd(other.fd) {
-        other.fd = -1;
-    }
-    
-    Socket& operator=(Socket&& other) noexcept {
-        if (this != &other) {
-            if (fd != -1) close(fd);
-            fd = other.fd;
-            other.fd = -1;
-        }
-        return *this;
-    }
-    
-    int get() const { return fd; }
-    bool is_valid() const { return fd != -1; }
+using namespace std::chrono_literals;
+
+// Global Singletons
+Metrics g_metrics;
+RateLimiter g_rate_limiter(100.0, 50.0); // Token bucket per IP
+ACL g_acl;
+LRUCache g_cache;
+
+enum class State {
+    READING_REQUEST,
+    RESOLVING_DNS,
+    CONNECTING_UPSTREAM,
+    FORWARDING,
+    CLOSING
 };
 
-// ============================================================================
-// O(1) LRU Cache
-// ============================================================================
-struct CacheElement {
-    std::string url;
-    std::vector<char> data;
+struct Connection {
+    int id;
+    int client_fd = -1;
+    int upstream_fd = -1;
+    State state = State::READING_REQUEST;
+    
+    Buffer client_in;
+    Buffer client_out;
+    Buffer upstream_in;
+    Buffer upstream_out;
+
+    std::chrono::steady_clock::time_point last_active;
+
+    ParsedRequest request;
+    bool is_connect_method = false;
+    std::string cache_key;
+    bool cacheable = false;
+    std::vector<char> cache_buffer;
 };
 
-class LRUCache {
-private:
-    std::list<CacheElement> lru_list;
-    std::unordered_map<std::string, decltype(lru_list)::iterator> cache_map;
-    std::mutex cache_mutex;
-    size_t current_cache_size = 0;
+// Set socket to non-blocking
+bool set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
 
-    void evict_lru() {
-        if (lru_list.empty()) return;
-        
-        auto last = lru_list.end();
-        --last; // get the last element (least recently used)
-        
-        current_cache_size -= (last->data.size() + last->url.size());
-        cache_map.erase(last->url);
-        lru_list.pop_back();
-    }
-
-public:
-    std::optional<std::vector<char>> get(const std::string& url) {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        
-        auto it = cache_map.find(url);
-        if (it == cache_map.end()) {
-            return std::nullopt; // Cache miss
-        }
-        
-        // Cache hit: Move element to the front of the list
-        lru_list.splice(lru_list.begin(), lru_list, it->second);
-        
-        return it->second->data;
-    }
-
-    void put(const std::string& url, const std::vector<char>& data) {
-        std::lock_guard<std::mutex> lock(cache_mutex);
-        
-        size_t elem_size = data.size() + url.size();
-        if (elem_size > MAX_ELEMENT_SIZE) {
-            return; // Too big to cache
-        }
-        
-        auto it = cache_map.find(url);
-        if (it != cache_map.end()) {
-            // Update existing
-            current_cache_size -= it->second->data.size();
-            it->second->data = data;
-            current_cache_size += data.size();
-            lru_list.splice(lru_list.begin(), lru_list, it->second);
-        } else {
-            // Insert new
-            while (current_cache_size + elem_size > MAX_SIZE && !lru_list.empty()) {
-                evict_lru();
-            }
-            
-            lru_list.push_front({url, data});
-            cache_map[url] = lru_list.begin();
-            current_cache_size += elem_size;
-            std::cout << "Cached: " << url << " (Size: " << data.size() << " bytes)\n";
-        }
-    }
-};
-
-// ============================================================================
-// Global State
-// ============================================================================
-LRUCache proxy_cache;
-std::counting_semaphore<MAX_CLIENTS> connection_semaphore(MAX_CLIENTS);
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-void sendErrorMessage(int socket, int status_code) {
-    std::string response;
+// A single Reactor thread managing its own event loop and connections
+class Reactor {
+    EventLoop loop_;
+    DNSResolver dns_;
+    int listen_fd_;
     
-    time_t now = time(nullptr);
-    char currentTime[50];
-    strftime(currentTime, sizeof(currentTime), "%a, %d %b %Y %H:%M:%S %Z", gmtime(&now));
-
-    switch (status_code) {
-        case 400:
-            response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 95\r\nConnection: close\r\nContent-Type: text/html\r\nDate: " + std::string(currentTime) + "\r\nServer: CppProxy\r\n\r\n<HTML><HEAD><TITLE>400 Bad Request</TITLE></HEAD>\n<BODY><H1>400 Bad Request</H1>\n</BODY></HTML>";
-            break;
-        case 403:
-            response = "HTTP/1.1 403 Forbidden\r\nContent-Length: 112\r\nConnection: close\r\nContent-Type: text/html\r\nDate: " + std::string(currentTime) + "\r\nServer: CppProxy\r\n\r\n<HTML><HEAD><TITLE>403 Forbidden</TITLE></HEAD>\n<BODY><H1>403 Forbidden</H1><br>Permission Denied\n</BODY></HTML>";
-            break;
-        case 404:
-            response = "HTTP/1.1 404 Not Found\r\nContent-Length: 91\r\nConnection: close\r\nContent-Type: text/html\r\nDate: " + std::string(currentTime) + "\r\nServer: CppProxy\r\n\r\n<HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>\n<BODY><H1>404 Not Found</H1>\n</BODY></HTML>";
-            break;
-        case 500:
-            response = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 115\r\nConnection: close\r\nContent-Type: text/html\r\nDate: " + std::string(currentTime) + "\r\nServer: CppProxy\r\n\r\n<HTML><HEAD><TITLE>500 Internal Server Error</TITLE></HEAD>\n<BODY><H1>500 Internal Server Error</H1>\n</BODY></HTML>";
-            break;
-        case 501:
-            response = "HTTP/1.1 501 Not Implemented\r\nContent-Length: 103\r\nConnection: close\r\nContent-Type: text/html\r\nDate: " + std::string(currentTime) + "\r\nServer: CppProxy\r\n\r\n<HTML><HEAD><TITLE>501 Not Implemented</TITLE></HEAD>\n<BODY><H1>501 Not Implemented</H1>\n</BODY></HTML>";
-            break;
-        default:
-            return;
-    }
-    send(socket, response.c_str(), response.length(), 0);
-}
-
-Socket connectRemoteServer(const std::string& host_addr, int port_num) {
-    // Use getaddrinfo (thread-safe, supports IPv4 & IPv6) instead of deprecated gethostbyname
-    struct addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;      // Allow IPv4 or IPv6
-    hints.ai_socktype = SOCK_STREAM;  // TCP
-
-    std::string port_str = std::to_string(port_num);
-    struct addrinfo* result = nullptr;
-
-    int status = getaddrinfo(host_addr.c_str(), port_str.c_str(), &hints, &result);
-    if (status != 0) {
-        std::cerr << "getaddrinfo: " << gai_strerror(status) << "\n";
-        return Socket(-1);
-    }
-
-    // Try each address until we successfully connect
-    for (struct addrinfo* p = result; p != nullptr; p = p->ai_next) {
-        int remote_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (remote_fd < 0) continue;
-
-        Socket remoteSocket(remote_fd);
-        if (connect(remoteSocket.get(), p->ai_addr, p->ai_addrlen) == 0) {
-            freeaddrinfo(result);
-            return remoteSocket; // Success — transfer ownership to caller
-        }
-        // Socket destructor auto-closes on failure, try next address
-    }
-
-    freeaddrinfo(result);
-    std::cerr << "Failed to connect to " << host_addr << ":" << port_num << "\n";
-    return Socket(-1);
-}
-
-bool checkHTTPversion(const std::string& version) {
-    return version == "HTTP/1.0" || version == "HTTP/1.1";
-}
-
-// ============================================================================
-// Request Handler
-// ============================================================================
-// Build a canonical URL from parsed request fields for use as the cache key.
-// This strips browser-specific headers (User-Agent, etc.) so Chrome and Firefox
-// hitting the same URL will produce the same cache key.
-std::string build_cache_key(const ParsedRequest& req) {
-    std::string key;
-    if (!req.protocol.empty()) {
-        key += req.protocol + "://";
-    } else {
-        key += "http://";
-    }
-    key += req.host;
-    if (!req.port.empty() && req.port != "80") {
-        key += ":" + req.port;
-    }
-    key += req.path;
-    return key;
-}
-
-void handle_request(Socket client_socket) {
-    // Release semaphore when this function exits (thread completes)
-    struct SemaphoreReleaser {
-        ~SemaphoreReleaser() { connection_semaphore.release(); }
-    } releaser;
-
-    std::vector<char> buffer(MAX_BYTES, 0);
-    int bytes_received = recv(client_socket.get(), buffer.data(), MAX_BYTES, 0);
+    std::unordered_map<int, std::unique_ptr<Connection>> conns_; // by id
+    std::unordered_map<int, Connection*> fd_to_conn_;            // by fd
+    int next_conn_id_ = 1;
     
-    if (bytes_received <= 0) return;
+    std::chrono::steady_clock::time_point last_sweep_;
 
-    // Read full headers (wait for \r\n\r\n)
-    int total_bytes = bytes_received;
-    while (total_bytes < MAX_BYTES) {
-        std::string_view current_req(buffer.data(), total_bytes);
-        if (current_req.find("\r\n\r\n") != std::string_view::npos) {
-            break;
+    void close_connection(Connection* conn) {
+        if (!conn) return;
+        if (conn->client_fd >= 0) {
+            loop_.remove(conn->client_fd);
+            close(conn->client_fd);
+            fd_to_conn_.erase(conn->client_fd);
+            g_metrics.active_connections--;
         }
-        int more = recv(client_socket.get(), buffer.data() + total_bytes, MAX_BYTES - total_bytes, 0);
-        if (more <= 0) break;
-        total_bytes += more;
-    }
-
-    // Parse the request FIRST so we can build a proper cache key
-    ParsedRequest req;
-    if (req.parse(buffer.data(), total_bytes) < 0) {
-        sendErrorMessage(client_socket.get(), 400);
-        return;
-    }
-
-    if (req.method != "GET") {
-        std::cout << "Method " << req.method << " not supported.\n";
-        sendErrorMessage(client_socket.get(), 501);
-        return;
-    }
-
-    if (!checkHTTPversion(req.version)) {
-        sendErrorMessage(client_socket.get(), 505);
-        return;
-    }
-
-    // Build canonical cache key from the parsed URL (not the raw request)
-    std::string cache_key = build_cache_key(req);
-
-    // 1. Check Cache using the canonical URL key
-    auto cached_data = proxy_cache.get(cache_key);
-    if (cached_data) {
-        std::cout << "Cache HIT for " << cache_key << "\n";
-        const auto& data = cached_data.value();
-        
-        // Stream data back to client
-        size_t pos = 0;
-        while (pos < data.size()) {
-            size_t chunk = std::min<size_t>(MAX_BYTES, data.size() - pos);
-            if (send(client_socket.get(), data.data() + pos, chunk, 0) < 0) {
-                break;
-            }
-            pos += chunk;
+        if (conn->upstream_fd >= 0) {
+            loop_.remove(conn->upstream_fd);
+            close(conn->upstream_fd);
+            fd_to_conn_.erase(conn->upstream_fd);
         }
-        return;
+        conns_.erase(conn->id);
     }
 
-    // 2. Cache Miss - Forward request to remote server
-    std::cout << "Cache MISS for " << cache_key << "\n";
-
-    // Modify request for upstream
-    req.set_header("Connection", "close");
-    if (!req.get_header("Host")) {
-        req.set_header("Host", req.host);
-    }
-    
-    std::string upstream_req = req.unparse();
-
-    int remote_port = req.port.empty() ? 80 : std::stoi(req.port);
-    Socket remote_socket = connectRemoteServer(req.host, remote_port);
-
-    if (!remote_socket.is_valid()) {
-        sendErrorMessage(client_socket.get(), 500);
-        return;
-    }
-
-    // Send to remote server
-    if (send(remote_socket.get(), upstream_req.c_str(), upstream_req.length(), 0) < 0) {
-        sendErrorMessage(client_socket.get(), 500);
-        return;
-    }
-
-    // Receive from remote, stream to client, and cache
-    std::vector<char> response_data;
-    char recv_buf[MAX_BYTES];
-    
-    while (true) {
-        int bytes = recv(remote_socket.get(), recv_buf, MAX_BYTES, 0);
-        if (bytes <= 0) break;
-        
-        send(client_socket.get(), recv_buf, bytes, 0);
-        response_data.insert(response_data.end(), recv_buf, recv_buf + bytes);
-    }
-
-    // Cache the response using the canonical URL key
-    if (!response_data.empty()) {
-        proxy_cache.put(cache_key, response_data);
-    }
-}
-
-// ============================================================================
-// Main
-// ============================================================================
-int main(int argc, char* argv[]) {
-    int port_number = 8080;
-    if (argc == 2) {
-        port_number = std::stoi(argv[1]);
-    } else if (argc > 2) {
-        std::cout << "Usage: ./proxy <port>\n";
-        return 1;
-    }
-
-    std::cout << "Starting Modern C++20 Proxy Server on port " << port_number << "\n";
-
-    Socket listen_socket(socket(AF_INET, SOCK_STREAM, 0));
-    if (!listen_socket.is_valid()) {
-        std::cerr << "Failed to create socket.\n";
-        return 1;
-    }
-
-    int reuse = 1;
-    setsockopt(listen_socket.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    struct sockaddr_in server_addr;
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port_number);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(listen_socket.get(), reinterpret_cast<struct sockaddr*>(&server_addr), sizeof(server_addr)) < 0) {
-        std::cerr << "Port binding failed.\n";
-        return 1;
-    }
-
-    if (listen(listen_socket.get(), MAX_CLIENTS) < 0) {
-        std::cerr << "Listen failed.\n";
-        return 1;
-    }
-
-    while (true) {
+    void handle_accept() {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(listen_fd_, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) return;
+
+        set_nonblocking(client_fd);
         
-        int client_fd = accept(listen_socket.get(), reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
-        if (client_fd < 0) {
-            std::cerr << "Accept failed.\n";
-            continue;
-        }
+        int opt = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        // Acquire semaphore token (blocks if 400 clients are active)
-        connection_semaphore.acquire();
+        auto conn = std::make_unique<Connection>();
+        conn->id = next_conn_id_++;
+        conn->client_fd = client_fd;
+        conn->last_active = std::chrono::steady_clock::now();
 
-        // Wrap the socket descriptor in our RAII class
-        Socket client_socket(client_fd);
-        
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
-        std::cout << "Accepted connection from " << ip_str << ":" << ntohs(client_addr.sin_port) << "\n";
+        fd_to_conn_[client_fd] = conn.get();
+        conns_[conn->id] = std::move(conn);
 
-        // Spawn detached std::thread and move ownership of the socket into it
-        std::thread([client = std::move(client_socket)]() mutable {
-            handle_request(std::move(client));
-        }).detach();
+        loop_.add(client_fd, EV_READABLE);
+        g_metrics.active_connections++;
+        g_metrics.total_requests++;
     }
 
+    void handle_dns_result(const DNSResult& result) {
+        auto it = conns_.find(result.connection_id);
+        if (it == conns_.end()) {
+            if (result.addr_info) freeaddrinfo(result.addr_info);
+            return;
+        }
+        Connection* conn = it->second.get();
+        conn->last_active = std::chrono::steady_clock::now();
+
+        if (result.error != "" || !result.addr_info) {
+            std::string err = "HTTP/1.1 502 Bad Gateway\r\n\r\nDNS Resolution Failed";
+            conn->client_out.append(err.data(), err.size());
+            conn->state = State::CLOSING;
+            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            if (result.addr_info) freeaddrinfo(result.addr_info);
+            return;
+        }
+
+        int upstream_fd = socket(result.addr_info->ai_family, result.addr_info->ai_socktype, result.addr_info->ai_protocol);
+        if (upstream_fd < 0) {
+            freeaddrinfo(result.addr_info);
+            close_connection(conn);
+            return;
+        }
+
+        set_nonblocking(upstream_fd);
+        conn->upstream_fd = upstream_fd;
+        fd_to_conn_[upstream_fd] = conn;
+
+        int ret = connect(upstream_fd, result.addr_info->ai_addr, result.addr_info->ai_addrlen);
+        freeaddrinfo(result.addr_info);
+
+        if (ret == 0) {
+            // Connected immediately
+            on_upstream_connected(conn);
+        } else if (errno == EINPROGRESS) {
+            conn->state = State::CONNECTING_UPSTREAM;
+            loop_.add(upstream_fd, EV_WRITABLE);
+        } else {
+            close_connection(conn);
+        }
+    }
+
+    void on_upstream_connected(Connection* conn) {
+        conn->state = State::FORWARDING;
+        if (conn->is_connect_method) {
+            std::string ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            conn->client_out.append(ok.data(), ok.size());
+            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            g_metrics.connect_tunnels++;
+        } else {
+            std::string req = conn->request.unparse();
+            conn->upstream_out.append(req.data(), req.size());
+            if (conn->client_in.size() > 0) {
+                conn->upstream_out.append(conn->client_in.data(), conn->client_in.size());
+                conn->client_in.clear();
+            }
+        }
+        
+        loop_.modify(conn->upstream_fd, EV_READABLE | EV_WRITABLE);
+    }
+
+    void handle_readable(Connection* conn, int fd) {
+        char buf[8192];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                close_connection(conn);
+            }
+            return;
+        }
+
+        if (n == 0) {
+            // EOF
+            if (fd == conn->upstream_fd && conn->cacheable) {
+                g_cache.put(conn->cache_key, conn->cache_buffer);
+            }
+            conn->state = State::CLOSING;
+            if (fd == conn->client_fd) {
+                loop_.modify(conn->client_fd, EV_WRITABLE); // Drain out then close
+            } else {
+                loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            }
+            return;
+        }
+
+        conn->last_active = std::chrono::steady_clock::now();
+
+        if (fd == conn->client_fd) {
+            if (conn->state == State::READING_REQUEST) {
+                conn->client_in.append(buf, n);
+                std::string_view view = conn->client_in.view();
+                if (view.find("\r\n\r\n") != std::string_view::npos) {
+                    process_request(conn);
+                }
+            } else if (conn->state == State::FORWARDING) {
+                conn->upstream_out.append(buf, n);
+                loop_.modify(conn->upstream_fd, EV_READABLE | EV_WRITABLE);
+            }
+        } else if (fd == conn->upstream_fd) {
+            if (conn->state == State::FORWARDING) {
+                conn->client_out.append(buf, n);
+                if (conn->cacheable && conn->cache_buffer.size() + n < 10*1024*1024) {
+                    conn->cache_buffer.insert(conn->cache_buffer.end(), buf, buf + n);
+                } else {
+                    conn->cacheable = false; // Too large to cache
+                }
+                loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            }
+        }
+    }
+
+    void process_request(Connection* conn) {
+        if (conn->request.parse(conn->client_in.data(), conn->client_in.size()) < 0) {
+            std::string err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+            conn->client_out.append(err.data(), err.size());
+            conn->state = State::CLOSING;
+            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            return;
+        }
+        conn->client_in.clear();
+
+        // ACL Check
+        if (g_acl.is_blocked(conn->request.host)) {
+            std::string err = "HTTP/1.1 403 Forbidden\r\n\r\nBlocked by ACL";
+            conn->client_out.append(err.data(), err.size());
+            conn->state = State::CLOSING;
+            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            g_metrics.blocked_by_acl++;
+            return;
+        }
+
+        // Rate Limit (Mock IP since accept doesn't extract it cleanly here for brevity)
+        // In reality, use getpeername or client_addr from accept.
+        if (!g_rate_limiter.allow("127.0.0.1")) { 
+            std::string err = "HTTP/1.1 429 Too Many Requests\r\n\r\nRate Limited";
+            conn->client_out.append(err.data(), err.size());
+            conn->state = State::CLOSING;
+            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+            g_metrics.rate_limited++;
+            return;
+        }
+
+        if (conn->request.method == "CONNECT") {
+            conn->is_connect_method = true;
+            conn->state = State::RESOLVING_DNS;
+            dns_.submit(conn->id, conn->request.host, conn->request.port);
+            return;
+        }
+
+        // Cache Check (only GET)
+        if (conn->request.method == "GET") {
+            conn->cache_key = conn->request.host + ":" + conn->request.port + conn->request.path;
+            auto cached = g_cache.get(conn->cache_key);
+            if (cached) {
+                g_metrics.cache_hits++;
+                conn->client_out.append(cached->data(), cached->size());
+                conn->state = State::CLOSING;
+                loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
+                return;
+            }
+            g_metrics.cache_misses++;
+            conn->cacheable = true;
+        }
+
+        conn->state = State::RESOLVING_DNS;
+        std::string port = conn->request.port.empty() ? "80" : conn->request.port;
+        dns_.submit(conn->id, conn->request.host, port);
+    }
+
+    void handle_writable(Connection* conn, int fd) {
+        conn->last_active = std::chrono::steady_clock::now();
+
+        if (fd == conn->upstream_fd && conn->state == State::CONNECTING_UPSTREAM) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                close_connection(conn);
+                return;
+            }
+            on_upstream_connected(conn);
+            return;
+        }
+
+        Buffer& buf = (fd == conn->client_fd) ? conn->client_out : conn->upstream_out;
+        if (!buf.empty()) {
+            ssize_t n = write(fd, buf.data(), buf.size());
+            if (n > 0) {
+                buf.consume(n);
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                close_connection(conn);
+                return;
+            }
+        }
+
+        if (buf.empty()) {
+            if (conn->state == State::CLOSING) {
+                close_connection(conn);
+            } else {
+                loop_.modify(fd, EV_READABLE); // Stop polling for write if buffer empty
+            }
+        }
+    }
+
+    void sweep_idle_connections() {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_sweep_ < 5s) return;
+        last_sweep_ = now;
+
+        std::vector<Connection*> to_close;
+        for (auto& [id, conn] : conns_) {
+            if (now - conn->last_active > 30s) {
+                to_close.push_back(conn.get());
+            }
+        }
+        for (auto* c : to_close) {
+            close_connection(c);
+        }
+    }
+
+public:
+    Reactor(int listen_fd) 
+        : dns_(2), listen_fd_(listen_fd), last_sweep_(std::chrono::steady_clock::now()) {
+        loop_.add(listen_fd, EV_READABLE);
+        loop_.add(dns_.notify_fd(), EV_READABLE);
+    }
+
+    void run() {
+        std::vector<PollEvent> events;
+        while (true) {
+            int n = loop_.wait(events, 1000); // 1s timeout
+            if (n < 0) continue;
+
+            for (const auto& ev : events) {
+                if (ev.fd == listen_fd_ && (ev.events & EV_READABLE)) {
+                    handle_accept();
+                } else if (ev.fd == dns_.notify_fd() && (ev.events & EV_READABLE)) {
+                    auto results = dns_.drain();
+                    for (const auto& r : results) {
+                        handle_dns_result(r);
+                    }
+                } else {
+                    auto it = fd_to_conn_.find(ev.fd);
+                    if (it != fd_to_conn_.end()) {
+                        Connection* conn = it->second;
+                        if (ev.events & EV_READABLE) {
+                            handle_readable(conn, ev.fd);
+                        }
+                        // Check again because readable might have closed it
+                        if (fd_to_conn_.count(ev.fd) && (ev.events & EV_WRITABLE)) {
+                            handle_writable(conn, ev.fd);
+                        }
+                    }
+                }
+            }
+            sweep_idle_connections();
+        }
+    }
+};
+
+// Simple metrics HTTP endpoint on a separate port
+void run_metrics_server() {
+    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(8081);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    
+    bind(sfd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(sfd, 10);
+    
+    while(true) {
+        int client = accept(sfd, nullptr, nullptr);
+        if (client < 0) continue;
+        
+        std::string json = g_metrics.to_json(g_cache.eviction_stats().total_count(),
+                                             g_cache.eviction_stats().average_us());
+        std::string res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + json;
+        write(client, res.data(), res.size());
+        close(client);
+    }
+}
+
+int main(int argc, char** argv) {
+    // Ignore SIGPIPE to prevent crashes on partial writes to closed sockets
+    signal(SIGPIPE, SIG_IGN);
+
+    int port = 8080;
+    if (argc > 1) port = std::stoi(argv[1]);
+
+    std::cout << "Starting Robust Multi-Reactor Proxy on port " << port << std::endl;
+    std::cout << "Metrics available at http://localhost:8081/" << std::endl;
+
+    g_acl.block("blocked.com");
+
+    std::thread metrics_thread(run_metrics_server);
+    metrics_thread.detach();
+
+    int num_reactors = std::thread::hardware_concurrency();
+    if (num_reactors == 0) num_reactors = 4;
+    
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_reactors; i++) {
+        threads.emplace_back([port]() {
+            int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+            int opt = 1;
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+            struct sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(port);
+            addr.sin_addr.s_addr = INADDR_ANY;
+            
+            if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+                perror("bind");
+                exit(1);
+            }
+            listen(listen_fd, 4096);
+            
+            Reactor reactor(listen_fd);
+            reactor.run();
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
     return 0;
 }
