@@ -29,7 +29,7 @@ using namespace std::chrono_literals;
 
 // Global Singletons
 Metrics g_metrics;
-RateLimiter g_rate_limiter(100.0, 50.0); // Token bucket per IP
+RateLimiter g_rate_limiter(100000.0, 100000.0); // High limit for benchmarking
 ACL g_acl;
 LRUCache g_cache;
 
@@ -285,6 +285,9 @@ class Reactor {
             g_metrics.cache_misses++;
             conn->cacheable = true;
         }
+
+        // Force Connection: close to ensure upstream doesn't keep-alive (fixes ab timeout)
+        conn->request.set_header("Connection", "close");
 
         conn->state = State::RESOLVING_DNS;
         std::string port = conn->request.port.empty() ? "80" : conn->request.port;
