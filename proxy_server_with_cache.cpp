@@ -45,6 +45,7 @@ struct Connection {
     int id;
     int client_fd = -1;
     int upstream_fd = -1;
+    std::string client_ip;
     State state = State::READING_REQUEST;
     
     Buffer client_in;
@@ -111,6 +112,10 @@ class Reactor {
         conn->id = next_conn_id_++;
         conn->client_fd = client_fd;
         conn->last_active = std::chrono::steady_clock::now();
+
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        conn->client_ip = client_ip;
 
         fd_to_conn_[client_fd] = conn.get();
         conns_[conn->id] = std::move(conn);
@@ -253,9 +258,8 @@ class Reactor {
             return;
         }
 
-        // Rate Limit (Mock IP since accept doesn't extract it cleanly here for brevity)
-        // In reality, use getpeername or client_addr from accept.
-        if (!g_rate_limiter.allow("127.0.0.1")) { 
+        // Rate Limit per IP
+        if (!g_rate_limiter.allow(conn->client_ip)) { 
             std::string err = "HTTP/1.1 429 Too Many Requests\r\n\r\nRate Limited";
             conn->client_out.append(err.data(), err.size());
             conn->state = State::CLOSING;
