@@ -21,16 +21,12 @@
 #include "dns_resolver.hpp"
 #include "lru_cache.hpp"
 #include "metrics.hpp"
-#include "acl.hpp"
-#include "rate_limiter.hpp"
 #include "proxy_parse.hpp"
 
 using namespace std::chrono_literals;
 
 // Global Singletons
 Metrics g_metrics;
-RateLimiter g_rate_limiter(100000.0, 100000.0); // High limit for benchmarking
-ACL g_acl;
 LRUCache g_cache;
 
 enum class State {
@@ -45,7 +41,6 @@ struct Connection {
     int id;
     int client_fd = -1;
     int upstream_fd = -1;
-    std::string client_ip;
     State state = State::READING_REQUEST;
     
     Buffer client_in;
@@ -112,10 +107,6 @@ class Reactor {
         conn->id = next_conn_id_++;
         conn->client_fd = client_fd;
         conn->last_active = std::chrono::steady_clock::now();
-
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        conn->client_ip = client_ip;
 
         fd_to_conn_[client_fd] = conn.get();
         conns_[conn->id] = std::move(conn);
@@ -247,26 +238,6 @@ class Reactor {
             return;
         }
         conn->client_in.clear();
-
-        // ACL Check
-        if (g_acl.is_blocked(conn->request.host)) {
-            std::string err = "HTTP/1.1 403 Forbidden\r\n\r\nBlocked by ACL";
-            conn->client_out.append(err.data(), err.size());
-            conn->state = State::CLOSING;
-            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
-            g_metrics.blocked_by_acl++;
-            return;
-        }
-
-        // Rate Limit per IP
-        if (!g_rate_limiter.allow(conn->client_ip)) { 
-            std::string err = "HTTP/1.1 429 Too Many Requests\r\n\r\nRate Limited";
-            conn->client_out.append(err.data(), err.size());
-            conn->state = State::CLOSING;
-            loop_.modify(conn->client_fd, EV_READABLE | EV_WRITABLE);
-            g_metrics.rate_limited++;
-            return;
-        }
 
         if (conn->request.method == "CONNECT") {
             conn->is_connect_method = true;
@@ -423,8 +394,6 @@ int main(int argc, char** argv) {
 
     std::cout << "Starting Robust Multi-Reactor Proxy on port " << port << std::endl;
     std::cout << "Metrics available at http://localhost:8081/" << std::endl;
-
-    g_acl.block("blocked.com");
 
     std::thread metrics_thread(run_metrics_server);
     metrics_thread.detach();

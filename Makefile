@@ -4,7 +4,7 @@ CXXFLAGS = -std=c++20 -Wall -Wextra -pthread -O3
 # Files
 SRCS = proxy_server_with_cache.cpp proxy_parse.cpp
 OBJS = $(SRCS:.cpp=.o)
-HEADERS = buffer.hpp metrics.hpp acl.hpp rate_limiter.hpp lru_cache.hpp event_loop.hpp dns_resolver.hpp proxy_parse.hpp
+HEADERS = buffer.hpp metrics.hpp lru_cache.hpp event_loop.hpp dns_resolver.hpp proxy_parse.hpp
 
 TARGET = proxy
 
