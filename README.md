@@ -12,8 +12,6 @@ This project was recently refactored from a `std::thread`-per-connection model i
 *   **Asynchronous DNS Thread Pool:** Offloads blocking `getaddrinfo` syscalls to a dedicated thread pool. When DNS resolves, a pipe notifies the epoll loop, ensuring the reactor thread never freezes.
 *   **HTTPS `CONNECT` Tunneling:** Intercepts `CONNECT` requests to function as a blind TCP relay for encrypted HTTPS traffic.
 *   **Security & Resilience:** 
-    *   **Rate Limiting:** A thread-safe Token Bucket algorithm per IP address, defending against DDoS attacks with `429 Too Many Requests`.
-    *   **ACL Blocklist:** Instantly rejects requests to blocked domains with `403 Forbidden`.
     *   **Idle Reaper:** Periodically sweeps and closes dead connections to prevent file descriptor leaks.
     *   **Memory Safety:** Built and verified with AddressSanitizer (`-fsanitize=address`) to guarantee zero leaks in manual state management.
 *   **Live JSON Metrics Endpoint:** Exposes a lock-free atomic dashboard on `http://localhost:8081/` tracking Cache Hit Ratio, Eviction Latency, and Active Connections in real-time.
@@ -23,7 +21,7 @@ This project was recently refactored from a `std::thread`-per-connection model i
 Tested with ApacheBench (`ab`) using 500 requests at 50 concurrency:
 *   **Median Latency (50% of requests):** 0 ms (Served instantly from RAM).
 *   **Cache Hit Ratio:** 90% (under benchmark load).
-*   **Throughput Reliability:** Handled full concurrency gracefully with the embedded Rate Limiter turned off.
+*   **Throughput Reliability:** Handled full concurrency gracefully without dropped connections.
 
 ## 📦 Prerequisites
 
